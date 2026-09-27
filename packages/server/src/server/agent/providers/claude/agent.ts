@@ -15,6 +15,7 @@ import {
   type SDKMessage,
   type SDKPartialAssistantMessage,
   type SDKResultMessage,
+  type SDKSessionStateChangedMessage,
   type SDKSystemMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -2129,6 +2130,9 @@ class ClaudeAgentSession implements AgentSession {
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
+  // Last session_state_changed the CLI reported, or null when it never emits one (older CLI,
+  // custom executable) and the frame heuristic alone decides when an autonomous turn opens.
+  private claudeSessionState: SDKSessionStateChangedMessage["state"] | null = null;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
   private readonly contextUsage: ClaudeContextUsageState;
@@ -3346,7 +3350,9 @@ class ClaudeAgentSession implements AgentSession {
       forwardSubagentText: true,
       hooks: this.buildSubagentEffortHooks(),
       ...(this.persistSession === undefined ? {} : { persistSession: this.persistSession }),
-      env: sdkEnv,
+      // Makes the CLI announce session_state_changed, the turn-over signal that decides when an
+      // autonomous turn opens and closes (see consumeSessionStateChange).
+      env: { ...sdkEnv, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
     };
 
     if (this.config.mcpServers) {
@@ -3894,10 +3900,19 @@ class ClaudeAgentSession implements AgentSession {
    *
    * A backgrounded subagent streams on the same channel as its parent, and those frames carry the
    * parent's tool use id. They are the child working, not the main session starting something, and
-   * no result ever closes a turn opened from them — so reading one as turn-opening left the parent
+   * no result ever closes a turn opened from them, so reading one as turn-opening left the parent
    * locked reporting "running" for as long as the child ran, refusing every message sent meanwhile.
+   *
+   * A subagent's own background job notifies with no parent tool use id, and no frame-shape rule
+   * can tell it apart from the main session's. So when the CLI reports session state, no frame
+   * opens a turn while Claude says it is idle. While it says running, frames still may: Claude can
+   * drain queued input into a second result without going idle in between, and that work needs a
+   * turn to land on. Either way the idle that follows closes it (consumeSessionStateChange).
    */
   private shouldStartAutonomousTurn(message: SDKMessage): boolean {
+    if (this.claudeSessionState === "idle") {
+      return false;
+    }
     if (this.activeForegroundTurnId || this.pendingInterruptAbort) {
       return false;
     }
@@ -3907,7 +3922,36 @@ class ClaudeAgentSession implements AgentSession {
     return this.isAssistantishMessage(message);
   }
 
+  /**
+   * Claude's own account of whether the main session is working. "idle" fires only after the
+   * held-back result flushes and background agents settle, so it is the turn-over signal.
+   *
+   * It drives autonomous turns only. Foreground turns still close on their result: an idle can
+   * trail the previous turn and land just after a new send, and it must not end that send.
+   *
+   * Returns true when the frame was a state change, which is bookkeeping and never reaches the
+   * timeline.
+   */
+  private consumeSessionStateChange(message: SDKMessage): boolean {
+    if (message.type !== "system" || message.subtype !== "session_state_changed") {
+      return false;
+    }
+    this.claudeSessionState = message.state;
+    if (message.state === "idle") {
+      // Safety net: whatever opened the autonomous turn, Claude has stopped working.
+      this.completeAutonomousTurn();
+      return true;
+    }
+    if (!this.activeForegroundTurnId && !this.pendingInterruptAbort) {
+      this.startAutonomousTurn();
+    }
+    return true;
+  }
+
   private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
+    if (this.consumeSessionStateChange(message)) {
+      return;
+    }
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
