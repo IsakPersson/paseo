@@ -239,6 +239,12 @@ export class ClaudeTaskProtocolSource {
     return subagentId !== undefined && this.declaredIds.has(subagentId);
   }
 
+  /** Whether this task is a subagent running in the background, so it outlives the turn. */
+  isBackgroundedTask(taskId: string): boolean {
+    const subagentId = this.subagentIdByTaskId.get(taskId);
+    return subagentId !== undefined && this.backgroundedIds.has(subagentId);
+  }
+
   /** Resolve a non-subagent task (for example local_bash) to its emitting sidechain. */
   resolveTaskOwner(taskId: string, toolUseId?: string): string | undefined {
     return (

@@ -1243,6 +1243,138 @@ describe("ClaudeAgentSession features", () => {
     }
   });
 
+  interface PermissionInternals {
+    handlePermissionRequest(
+      name: string,
+      input: Record<string, unknown>,
+      options: Record<string, unknown>,
+    ): Promise<PermissionResult>;
+    translateMessageToEvents(message: SDKMessage): AgentStreamEvent[];
+    failActiveTurns(errorMessage: string): void;
+  }
+
+  /** A Task subagent announced on the main stream; a background one outlives the turn. */
+  function subagentStarted(taskId: string, isBackgrounded: boolean): SDKMessage {
+    return {
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: `toolu_${taskId}`,
+      task_type: "local_agent",
+      subagent_type: "general-purpose",
+      description: "Helper",
+      is_backgrounded: isBackgrounded,
+    } as unknown as SDKMessage;
+  }
+
+  test("a human steer leaves a background subagent's permission request for the user", async () => {
+    const { queryFactory } = createQueryMock();
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    const internal = session as unknown as PermissionInternals;
+
+    try {
+      const { turnId } = await session.startTurn("first turn");
+      internal.translateMessageToEvents(subagentStarted("helper-task", true));
+      const helperPermission = internal.handlePermissionRequest(
+        "Bash",
+        { command: "npm test" },
+        { toolUseID: "tool-helper", agentID: "helper-task" },
+      );
+      const mainPermission = internal.handlePermissionRequest(
+        "Write",
+        { file_path: "MAIN.md" },
+        { toolUseID: "tool-main" },
+      );
+
+      await expect(
+        session.steerActiveTurn?.("do this instead", {
+          expectedTurnId: turnId,
+          clearPendingPermissions: true,
+        }),
+      ).resolves.toEqual({ status: "accepted" });
+      await expect(mainPermission).resolves.toMatchObject({
+        behavior: "deny",
+        message: expect.stringContaining("message instead of approving"),
+      });
+      // The helper keeps asking while the steer is still unread; that is not superseded either.
+      const laterHelperPermission = internal.handlePermissionRequest(
+        "Bash",
+        { command: "npm run lint" },
+        { toolUseID: "tool-helper-2", agentID: "helper-task" },
+      );
+
+      const pending = session.getPendingPermissions();
+      expect(pending.map((request) => request.metadata?.toolUseId)).toEqual([
+        "tool-helper",
+        "tool-helper-2",
+      ]);
+      expect(pending.every((request) => request.fromProviderSubagent)).toBe(true);
+      for (const request of pending) {
+        await session.respondToPermission(request.id, { behavior: "allow" });
+      }
+      await expect(helperPermission).resolves.toMatchObject({ behavior: "allow" });
+      await expect(laterHelperPermission).resolves.toMatchObject({ behavior: "allow" });
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("stopping the turn leaves only a background subagent's permission request pending", async () => {
+    const { queryFactory } = createQueryMock();
+    const session = await new ClaudeAgentClient({
+      logger,
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    const internal = session as unknown as PermissionInternals;
+
+    try {
+      await session.startTurn("first turn");
+      internal.translateMessageToEvents(subagentStarted("helper-task", true));
+      internal.translateMessageToEvents(subagentStarted("foreground-task", false));
+      const helperPermission = internal.handlePermissionRequest(
+        "Bash",
+        { command: "npm test" },
+        { toolUseID: "tool-helper", agentID: "helper-task" },
+      );
+      // A foreground subagent is part of the turn waiting on it, so its request goes with it.
+      const foregroundPermission = internal.handlePermissionRequest(
+        "Bash",
+        { command: "ls" },
+        { toolUseID: "tool-foreground", agentID: "foreground-task" },
+      );
+      const mainPermission = internal.handlePermissionRequest(
+        "Write",
+        { file_path: "MAIN.md" },
+        { toolUseID: "tool-main" },
+      );
+
+      await session.interrupt();
+
+      await expect(mainPermission).rejects.toThrow("Permission request canceled");
+      await expect(foregroundPermission).rejects.toThrow("Permission request canceled");
+      expect(session.getPendingPermissions()).toEqual([
+        expect.objectContaining({
+          fromProviderSubagent: true,
+          metadata: { toolUseId: "tool-helper" },
+        }),
+      ]);
+
+      // Its request can outlive the turn, but not the Claude process that raised it.
+      internal.failActiveTurns("Claude stream ended before terminal result");
+      await expect(helperPermission).rejects.toThrow(
+        "Claude stopped before the request was answered",
+      );
+      expect(session.getPendingPermissions()).toEqual([]);
+    } finally {
+      await session.close();
+    }
+  });
+
   test.each([
     ["supported model", "claude-opus-4-8", { type: "disabled" }, undefined],
     ["unsupported model", "claude-fable-5", { type: "adaptive" }, "high"],
