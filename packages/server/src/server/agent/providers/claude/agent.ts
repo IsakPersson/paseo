@@ -455,6 +455,27 @@ function isErroredAssistantMessage(message: SDKMessage): boolean {
   return typeof error === "string" && error.length > 0;
 }
 
+/**
+ * Claude opens every main-session turn with system/init and closes it with exactly one result:
+ * a prompt, a wake-up after background work, a slash command, an API error. Background subagents
+ * never emit either on the main stream.
+ */
+function isClaudeTurnInit(message: SDKMessage): boolean {
+  return message.type === "system" && message.subtype === "init";
+}
+
+/**
+ * What opens an autonomous turn (work the main session starts with no prompt from Paseo, such as
+ * waking up after a background subagent finishes).
+ *
+ * - "init": Claude's own turn start (isClaudeTurnInit).
+ * - "frames": the older guess from frame shape (shouldStartAutonomousTurn). A subagent's own
+ *   background job looks like main-session work to it, which left agents stuck "running".
+ *   Kept, dormant, so this change can be rolled back by flipping the constant.
+ */
+type AutonomousTurnSignal = "init" | "frames";
+const AUTONOMOUS_TURN_SIGNAL = "init" as AutonomousTurnSignal;
+
 function firstStringField(
   input: Record<string, unknown>,
   primaryKey: string,
@@ -2131,7 +2152,7 @@ class ClaudeAgentSession implements AgentSession {
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
   // Last session_state_changed the CLI reported, or null when it never emits one (older CLI,
-  // custom executable) and the frame heuristic alone decides when an autonomous turn opens.
+  // custom executable). Only the dormant frame heuristic reads it.
   private claudeSessionState: SDKSessionStateChangedMessage["state"] | null = null;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
@@ -3350,8 +3371,8 @@ class ClaudeAgentSession implements AgentSession {
       forwardSubagentText: true,
       hooks: this.buildSubagentEffortHooks(),
       ...(this.persistSession === undefined ? {} : { persistSession: this.persistSession }),
-      // Makes the CLI announce session_state_changed, the turn-over signal that decides when an
-      // autonomous turn opens and closes (see consumeSessionStateChange).
+      // Makes the CLI announce session_state_changed, whose "idle" is the safety net that closes
+      // an autonomous turn (see consumeSessionStateChange).
       env: { ...sdkEnv, CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
     };
 
@@ -3893,6 +3914,9 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
+   * The frame heuristic that opened autonomous turns before Claude's own turn start did. Dormant:
+   * only read when AUTONOMOUS_TURN_SIGNAL is "frames", and kept for rollback.
+   *
    * Claude keeps talking about the request it was told to kill — the notification for the tool it
    * just stopped, trailing assistant output. That is not new work, so it must not open a turn: the
    * only message that would close that turn is the result shouldSuppressStaleResult drops, leaving
@@ -3923,11 +3947,13 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
-   * Claude's own account of whether the main session is working. "idle" fires only after the
-   * held-back result flushes and background agents settle, so it is the turn-over signal.
+   * Claude's account of whether anything in the session is working, which is not the same as the
+   * main session working: Claude Code 2.1.280 stays "running" for as long as any background
+   * subagent is alive. So "running" never opens a turn.
    *
-   * It drives autonomous turns only. Foreground turns still close on their result: an idle can
-   * trail the previous turn and land just after a new send, and it must not end that send.
+   * "idle" means nothing at all is running, so it closes an autonomous turn whatever opened it.
+   * It never closes a foreground turn: an idle can trail the previous turn and land just after a
+   * new send, and it must not end that send.
    *
    * Returns true when the frame was a state change, which is bookkeeping and never reaches the
    * timeline.
@@ -3938,26 +3964,43 @@ class ClaudeAgentSession implements AgentSession {
     }
     this.claudeSessionState = message.state;
     if (message.state === "idle") {
-      // Safety net: whatever opened the autonomous turn, Claude has stopped working.
       this.completeAutonomousTurn();
-      return true;
-    }
-    if (!this.activeForegroundTurnId && !this.pendingInterruptAbort) {
-      this.startAutonomousTurn();
     }
     return true;
+  }
+
+  /** Reads Claude's own turn brackets (isClaudeTurnInit). */
+  private observeMainTurnBracket(message: SDKMessage): void {
+    if (isClaudeTurnInit(message)) {
+      // A new turn has begun, so the interrupted one is over. An interrupt that landed after its
+      // turn had already ended gets no result, and the leftover flag would swallow this turn's.
+      this.pendingInterruptAbort = false;
+    }
+  }
+
+  /**
+   * Only the main session's own turn start opens an autonomous turn. Everything a background
+   * subagent emits (its task frames, its own background jobs' notifications, rate limit events)
+   * arrives outside one, and no result would ever close a turn it opened.
+   */
+  private opensAutonomousTurn(message: SDKMessage): boolean {
+    if (AUTONOMOUS_TURN_SIGNAL === "frames") {
+      return this.shouldStartAutonomousTurn(message);
+    }
+    return isClaudeTurnInit(message) && !this.activeForegroundTurnId;
   }
 
   private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
     if (this.consumeSessionStateChange(message)) {
       return;
     }
+    this.observeMainTurnBracket(message);
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
 
     const isForeground = Boolean(this.activeForegroundTurnId);
-    if (this.shouldStartAutonomousTurn(message)) {
+    if (this.opensAutonomousTurn(message)) {
       this.startAutonomousTurn();
     }
     if (!isForeground && !this.autonomousTurn && message.type === "result") {
