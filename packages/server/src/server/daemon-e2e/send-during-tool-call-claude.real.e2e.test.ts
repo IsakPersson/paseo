@@ -367,6 +367,50 @@ async function waitForProviderSubagentToExist(
   );
 }
 
+// Claude starts the wake-up turn a moment after the helper's completion lands (0.1 to 5 s in
+// recorded traces), so poll for it instead of checking the instant the helper reads completed.
+// The daemon announces an autonomous turn to subscribers as a pushed "running" agent_update,
+// not as an agent_stream turn_started (that stream reaches the client that started a run).
+async function waitForWakeTurn(
+  collector: ReturnType<typeof createMessageCollector>,
+  agentId: string,
+  fromIndex: number,
+  timeoutMs = 30_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const window = collector.messages.slice(fromIndex);
+    const woke =
+      getAgentStatuses(window, agentId).includes("running") ||
+      window.some(
+        (message) =>
+          message.type === "agent_stream" &&
+          message.payload.agentId === agentId &&
+          message.payload.event.type === "turn_started",
+      );
+    if (woke) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// The wake-up turn runs briefly after it opens, so the final state is read once it settles.
+async function waitForAgentStatus(
+  client: DaemonClient,
+  agentId: string,
+  status: string,
+  timeoutMs = 60_000,
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let last: string | undefined;
+  while (Date.now() < deadline) {
+    last = (await client.fetchAgent({ agentId }))?.agent.status;
+    if (last === status) return last;
+    await sleep(500);
+  }
+  return last;
+}
+
 // Polls agent.provider_subagents.list until the single backgrounded helper leaves "running".
 // Scenarios in this file always launch exactly one background helper, so subagents[0] is it.
 async function waitForProviderSubagentTerminal(
@@ -992,9 +1036,9 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
             "subagent_type: general-purpose.",
             `description: "nested bg survivor".`,
             `prompt: "Use the Bash tool with run_in_background: true to run exactly:`,
-            `python3 -c 'import time; time.sleep(12)'.`,
+            `python3 -c 'import time; time.sleep(5)'.`,
             `Immediately after starting it, without waiting for it, use the Bash tool again`,
-            `in the foreground to run exactly: python3 -c 'import time; time.sleep(41)'.`,
+            `in the foreground to run exactly: python3 -c 'import time; time.sleep(50)'.`,
             `After that foreground command finishes, reply exactly: CHILD_DONE."`,
             "Immediately after launching it, reply with the single word LAUNCHED and end your turn.",
             "Do not wait for it. Do not call any other tools.",
@@ -1012,12 +1056,13 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
         "idle",
       );
 
-      // The helper's own nested background job (12s) finishes while the helper is still busy
-      // in its unrelated foreground sleep (41s). Sample well past the nested job's completion,
+      // The helper's own nested background job (5s) finishes while the helper is still busy
+      // in its unrelated foreground sleep (50s). Sample for 30s, well past the nested job's
+      // completion even when the helper is slow to start it,
       // both by polling and by scanning every pushed agent_update in the window, so a brief
       // phantom flip cannot slip between polls.
       const sampleWindowStart = resources.collector.messages.length;
-      const polledStatuses = await sampleAgentStatuses(client, agent.id, 6, 3_000);
+      const polledStatuses = await sampleAgentStatuses(client, agent.id, 11, 3_000);
       const pushedStatuses = getAgentStatuses(
         resources.collector.messages.slice(sampleWindowStart),
         agent.id,
@@ -1076,14 +1121,13 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
 
       // The helper's completion should wake the main session with a fresh turn (the
       // session-state-driven autonomous turn), separate from the PONG exchange above.
-      const wakeWindowMessages = resources.collector.messages.slice(messagesBeforeWake);
-      const wokeMainAgent = wakeWindowMessages.some(
-        (message) =>
-          message.type === "agent_stream" &&
-          message.payload.agentId === agent.id &&
-          message.payload.event.type === "turn_started",
+      const wokeMainAgent = await waitForWakeTurn(
+        resources.collector,
+        agent.id,
+        messagesBeforeWake,
       );
       if (!wokeMainAgent) {
+        const wakeWindowMessages = resources.collector.messages.slice(messagesBeforeWake);
         const wakeWindowEventTypes = wakeWindowMessages
           .filter(
             (message) => message.type === "agent_stream" && message.payload.agentId === agent.id,
@@ -1101,8 +1145,9 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
         );
       }
 
-      const finalSnapshot = await client.fetchAgent({ agentId: agent.id });
-      expect(finalSnapshot?.agent.status, "the agent must end idle").toBe("idle");
+      expect(await waitForAgentStatus(client, agent.id, "idle"), "the agent must end idle").toBe(
+        "idle",
+      );
     } finally {
       const cleanup = await Promise.allSettled([
         Promise.resolve(resources.collector?.unsubscribe()),
@@ -1336,21 +1381,19 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
         "the helper's own transcript must contain its final CHILD_DONE reply",
       ).toContain("CHILD_DONE");
 
-      const wokeMainAgent = resources.collector.messages
-        .slice(messagesBeforeStop)
-        .some(
-          (message) =>
-            message.type === "agent_stream" &&
-            message.payload.agentId === agent.id &&
-            message.payload.event.type === "turn_started",
-        );
+      const wokeMainAgent = await waitForWakeTurn(
+        resources.collector,
+        agent.id,
+        messagesBeforeStop,
+      );
       expect(
         wokeMainAgent,
         "the helper's completion after Stop must wake the main session with a new turn",
       ).toBe(true);
 
-      const finalSnapshot = await client.fetchAgent({ agentId: agent.id });
-      expect(finalSnapshot?.agent.status, "the agent must end idle").toBe("idle");
+      expect(await waitForAgentStatus(client, agent.id, "idle"), "the agent must end idle").toBe(
+        "idle",
+      );
     } finally {
       const cleanup = await Promise.allSettled([
         Promise.resolve(resources.collector?.unsubscribe()),
