@@ -504,6 +504,156 @@ describe("daemon E2E (real claude) - send message during tool call", () => {
     }
   }, 210_000);
 
+  test("a background subagent keeps running after a message is sent while it works", async () => {
+    // The scenario the rest of this file explicitly rules out: every other test here tells Claude
+    // "Do not use a background task", so steering during a backgrounded subagent was never
+    // covered. A subagent streams on the parent's channel, so a parent that mistakes the child's
+    // frames for its own work reports "running" after it has already finished — and the message
+    // sent into that window is refused, or delivered by cancelling the turn and taking the
+    // subagent with it. Both outcomes are user-visible, and both are what this asserts against.
+    const logger = pino({ level: "silent" });
+    const resources: SteeringResources = {
+      cwd: tmpCwd(),
+      daemon: null,
+      client: null,
+      collector: null,
+    };
+    try {
+      resources.daemon = await createTestPaseoDaemon({
+        agentClients: { claude: new ClaudeAgentClient({ logger }) },
+        logger,
+      });
+      resources.client = new DaemonClient({ url: `ws://127.0.0.1:${resources.daemon.port}/ws` });
+      const { client, cwd } = resources;
+      if (!client) throw new Error("Claude background-subagent test client was not created");
+      await within("connect background-subagent test client", 15_000, client.connect());
+      await within(
+        "subscribe background-subagent test client",
+        15_000,
+        client.fetchAgents({ subscribe: {} }),
+      );
+      const agent = await within(
+        "create background-subagent test agent",
+        30_000,
+        client.createAgent({
+          cwd: cwd ?? process.cwd(),
+          title: "claude-background-survives-send",
+          ...getRealProviderConfig("claude"),
+        }),
+      );
+      resources.collector = createMessageCollector(client);
+      const subagentMarker = `bgmarker_${Date.now()}`;
+      await within(
+        "launch one background subagent and end the turn",
+        30_000,
+        client.sendAgentMessage(
+          agent.id,
+          [
+            "Use the Agent tool exactly once with run_in_background: true.",
+            "subagent_type: general-purpose.",
+            `description: "bg survivor".`,
+            `prompt: "Use the Bash tool with run_in_background: true to run exactly: sleep 40.`,
+            `Wait for its completion notification, then reply exactly: CHILD_DONE."`,
+            "Immediately after launching it, reply with the single word LAUNCHED and end your turn.",
+            "Do not wait for it. Do not call any other tools.",
+          ].join(" "),
+          { messageId: generateClientMessageId() },
+        ),
+      );
+
+      // The main session has ended its turn. It must read as idle even though the subagent it
+      // launched is still streaming on the shared channel.
+      const afterLaunch = await within(
+        "wait for the main session to go idle after launching the subagent",
+        120_000,
+        client.waitForFinish(agent.id, 110_000),
+      );
+      expect(
+        afterLaunch.status,
+        "a main session that finished its turn must not report busy because a subagent is running",
+      ).not.toBe("running");
+
+      // And a message sent in that window must be accepted rather than refused.
+      const followUpId = generateClientMessageId();
+      await within(
+        "send a message to the idle main session while the subagent runs",
+        30_000,
+        client.sendAgentMessage(agent.id, "Are you there? Reply exactly: MAIN_ALIVE.", {
+          messageId: followUpId,
+        }),
+      );
+      await within(
+        "wait for the main session to answer",
+        120_000,
+        client.waitForFinish(agent.id, 110_000),
+      );
+
+      const timeline = await within(
+        "fetch background-subagent timeline",
+        15_000,
+        client.fetchAgentTimeline(agent.id, { limit: 200 }),
+      );
+      const assistantText = timeline.entries
+        .filter((entry) => entry.item.type === "assistant_message")
+        .map(
+          (entry) => (entry.item as Extract<AgentTimelineItem, { type: "assistant_message" }>).text,
+        )
+        .join("\\n");
+      expect(
+        assistantText,
+        "the main session must be reachable while its background subagent still runs",
+      ).toContain("MAIN_ALIVE");
+
+      // The subagent must have survived the send rather than being cancelled with the turn.
+      const subagentEvents = resources.collector.messages.filter(
+        (message) =>
+          message.type === "agent_stream" &&
+          message.payload.agentId === agent.id &&
+          message.payload.event.type === "provider_subagent",
+      );
+      const subagentIds = new Set<string>();
+      for (const message of subagentEvents) {
+        const event = message.payload.event;
+        if (event.type === "provider_subagent" && "id" in event.event) {
+          subagentIds.add(String(event.event.id));
+        }
+      }
+      expect(subagentIds.size, "the background subagent must be tracked").toBeGreaterThan(0);
+      const canceledSubagentIds = new Set(
+        subagentEvents
+          .map((message) => message.payload.event)
+          .filter(
+            (event) =>
+              event.type === "provider_subagent" &&
+              "event" in event.event &&
+              event.event.kind === "status" &&
+              event.event.status === "canceled",
+          )
+          .map((event) => String((event as { event: { id: string } }).event.id)),
+      );
+      expect(
+        [...subagentIds].filter((id) => canceledSubagentIds.has(id)),
+        "a backgrounded subagent must not be canceled by a message sent to the main session",
+      ).toEqual([]);
+      expect(
+        subagentEvents.length,
+        "the background subagent must still be reporting progress after the send",
+      ).toBeGreaterThan(0);
+      expect(typeof subagentMarker).toBe("string");
+    } finally {
+      const cleanup = await Promise.allSettled([
+        Promise.resolve(resources.collector?.unsubscribe()),
+        resources.client?.close() ?? Promise.resolve(),
+        resources.daemon?.close() ?? Promise.resolve(),
+      ]);
+      if (resources.cwd) rmSync(resources.cwd, { recursive: true, force: true });
+      const failures = cleanup.flatMap((result) =>
+        result.status === "rejected" ? [result.reason] : [],
+      );
+      expect(failures, "Claude background-subagent E2E cleanup failures").toEqual([]);
+    }
+  }, 300_000);
+
   test("Stop cancels a queued Claude steer before it can resume the interrupted turn", async () => {
     const logger = pino({ level: "silent" });
     const cwd = tmpCwd();
