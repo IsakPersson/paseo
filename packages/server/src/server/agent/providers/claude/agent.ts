@@ -2654,7 +2654,7 @@ class ClaudeAgentSession implements AgentSession {
 
   private denyPendingPermissionsSupersededBySteer(): void {
     for (const [requestId, pending] of this.pendingPermissions) {
-      if (this.isBackgroundSubagentRequest(pending.subagentTaskId)) continue;
+      if (this.outlivesMainTurn(pending.subagentTaskId)) continue;
       this.pendingPermissions.delete(requestId);
       pending.cleanup?.();
       pending.resolve(
@@ -2667,13 +2667,14 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
-   * A background subagent's request belongs to that subagent, not the main turn: the subagent
-   * keeps running when the turn is stopped, and a message to the main session is no answer to
-   * it. A foreground subagent is part of the turn waiting on it, so its requests go with the turn.
+   * A request from a subagent outside the main turn belongs to that subagent: it keeps running
+   * when the turn is stopped, and a message to the main session is no answer to it. A foreground
+   * subagent the main session spawned is part of the turn waiting on it, so its requests go with
+   * the turn.
    */
-  private isBackgroundSubagentRequest(subagentTaskId: string | undefined): boolean {
+  private outlivesMainTurn(subagentTaskId: string | undefined): boolean {
     return (
-      subagentTaskId !== undefined && this.taskProtocolSource.isBackgroundedTask(subagentTaskId)
+      subagentTaskId !== undefined && !this.taskProtocolSource.isMainTurnSubagent(subagentTaskId)
     );
   }
 
@@ -4889,10 +4890,7 @@ class ClaudeAgentSession implements AgentSession {
       request,
     });
 
-    if (
-      this.permissionClearingSteerUuids.size > 0 &&
-      !this.isBackgroundSubagentRequest(options.agentID)
-    ) {
+    if (this.permissionClearingSteerUuids.size > 0 && !this.outlivesMainTurn(options.agentID)) {
       return this.resolveDeniedPermission(request, {
         behavior: "deny",
         message: STEER_SUPERSEDED_PERMISSION_MESSAGE,
@@ -5058,12 +5056,12 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
-   * "turn" settles what the main turn owned and leaves a background subagent's requests pending
-   * (isBackgroundSubagentRequest). "all" is for when nothing is left that could answer them.
+   * "turn" settles what the main turn owned and leaves the requests that outlive it pending
+   * (outlivesMainTurn). "all" is for when nothing is left that could answer them.
    */
   private rejectPendingPermissions(error: Error, scope: "turn" | "all") {
     for (const [id, pending] of this.pendingPermissions) {
-      if (scope === "turn" && this.isBackgroundSubagentRequest(pending.subagentTaskId)) continue;
+      if (scope === "turn" && this.outlivesMainTurn(pending.subagentTaskId)) continue;
       pending.cleanup?.();
       pending.reject(error);
       this.pendingPermissions.delete(id);

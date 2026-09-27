@@ -1253,8 +1253,8 @@ describe("ClaudeAgentSession features", () => {
     failActiveTurns(errorMessage: string): void;
   }
 
-  /** A Task subagent announced on the main stream; a background one outlives the turn. */
-  function subagentStarted(taskId: string, isBackgrounded: boolean): SDKMessage {
+  /** A Task subagent announced on the main stream. */
+  function subagentStarted(taskId: string, announced: Record<string, unknown>): SDKMessage {
     return {
       type: "system",
       subtype: "task_started",
@@ -1263,8 +1263,17 @@ describe("ClaudeAgentSession features", () => {
       task_type: "local_agent",
       subagent_type: "general-purpose",
       description: "Helper",
-      is_backgrounded: isBackgrounded,
+      spawn_depth: 1,
+      ...announced,
     } as unknown as SDKMessage;
+  }
+
+  function askAs(internal: PermissionInternals, agentID: string | undefined, toolUseID: string) {
+    return internal.handlePermissionRequest(
+      "Bash",
+      { command: "npm test" },
+      { toolUseID, ...(agentID ? { agentID } : {}) },
+    );
   }
 
   test("a human steer leaves a background subagent's permission request for the user", async () => {
@@ -1278,17 +1287,9 @@ describe("ClaudeAgentSession features", () => {
 
     try {
       const { turnId } = await session.startTurn("first turn");
-      internal.translateMessageToEvents(subagentStarted("helper-task", true));
-      const helperPermission = internal.handlePermissionRequest(
-        "Bash",
-        { command: "npm test" },
-        { toolUseID: "tool-helper", agentID: "helper-task" },
-      );
-      const mainPermission = internal.handlePermissionRequest(
-        "Write",
-        { file_path: "MAIN.md" },
-        { toolUseID: "tool-main" },
-      );
+      internal.translateMessageToEvents(subagentStarted("helper-task", { is_backgrounded: true }));
+      const helperPermission = askAs(internal, "helper-task", "tool-helper");
+      const mainPermission = askAs(internal, undefined, "tool-main");
 
       await expect(
         session.steerActiveTurn?.("do this instead", {
@@ -1301,11 +1302,7 @@ describe("ClaudeAgentSession features", () => {
         message: expect.stringContaining("message instead of approving"),
       });
       // The helper keeps asking while the steer is still unread; that is not superseded either.
-      const laterHelperPermission = internal.handlePermissionRequest(
-        "Bash",
-        { command: "npm run lint" },
-        { toolUseID: "tool-helper-2", agentID: "helper-task" },
-      );
+      const laterHelperPermission = askAs(internal, "helper-task", "tool-helper-2");
 
       const pending = session.getPendingPermissions();
       expect(pending.map((request) => request.metadata?.toolUseId)).toEqual([
@@ -1323,7 +1320,7 @@ describe("ClaudeAgentSession features", () => {
     }
   });
 
-  test("stopping the turn leaves only a background subagent's permission request pending", async () => {
+  test("stopping the turn leaves pending only what outlives it", async () => {
     const { queryFactory } = createQueryMock();
     const session = await new ClaudeAgentClient({
       logger,
@@ -1334,41 +1331,38 @@ describe("ClaudeAgentSession features", () => {
 
     try {
       await session.startTurn("first turn");
-      internal.translateMessageToEvents(subagentStarted("helper-task", true));
-      internal.translateMessageToEvents(subagentStarted("foreground-task", false));
-      const helperPermission = internal.handlePermissionRequest(
-        "Bash",
-        { command: "npm test" },
-        { toolUseID: "tool-helper", agentID: "helper-task" },
-      );
+      internal.translateMessageToEvents(subagentStarted("helper-task", { is_backgrounded: true }));
+      internal.translateMessageToEvents(subagentStarted("foreground-task", {}));
+      // Spawned inside the helper: it runs on the helper's time, not the turn's.
+      internal.translateMessageToEvents(subagentStarted("nested-task", { spawn_depth: 2 }));
+      const outliving = [
+        askAs(internal, "helper-task", "tool-helper"),
+        askAs(internal, "nested-task", "tool-nested"),
+        // A workflow's child agent is never declared as a subagent here.
+        askAs(internal, "workflow-child", "tool-workflow-child"),
+      ];
       // A foreground subagent is part of the turn waiting on it, so its request goes with it.
-      const foregroundPermission = internal.handlePermissionRequest(
-        "Bash",
-        { command: "ls" },
-        { toolUseID: "tool-foreground", agentID: "foreground-task" },
-      );
-      const mainPermission = internal.handlePermissionRequest(
-        "Write",
-        { file_path: "MAIN.md" },
-        { toolUseID: "tool-main" },
-      );
+      const foregroundPermission = askAs(internal, "foreground-task", "tool-foreground");
+      const mainPermission = askAs(internal, undefined, "tool-main");
 
       await session.interrupt();
 
       await expect(mainPermission).rejects.toThrow("Permission request canceled");
       await expect(foregroundPermission).rejects.toThrow("Permission request canceled");
-      expect(session.getPendingPermissions()).toEqual([
-        expect.objectContaining({
-          fromProviderSubagent: true,
-          metadata: { toolUseId: "tool-helper" },
-        }),
+      const pending = session.getPendingPermissions();
+      expect(pending.map((request) => request.metadata?.toolUseId)).toEqual([
+        "tool-helper",
+        "tool-nested",
+        "tool-workflow-child",
       ]);
+      expect(pending.every((request) => request.fromProviderSubagent)).toBe(true);
 
-      // Its request can outlive the turn, but not the Claude process that raised it.
-      internal.failActiveTurns("Claude stream ended before terminal result");
-      await expect(helperPermission).rejects.toThrow(
-        "Claude stopped before the request was answered",
+      // They can outlive the turn, but not the Claude process that raised them.
+      const withdrawn = outliving.map((permission) =>
+        expect(permission).rejects.toThrow("Claude stopped before the request was answered"),
       );
+      internal.failActiveTurns("Claude stream ended before terminal result");
+      await Promise.all(withdrawn);
       expect(session.getPendingPermissions()).toEqual([]);
     } finally {
       await session.close();
