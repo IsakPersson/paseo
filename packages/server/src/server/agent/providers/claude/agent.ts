@@ -443,6 +443,17 @@ function errorToMessageString(error: unknown): string {
   return "";
 }
 
+/**
+ * True when the frame is an assistant message the API refused to produce (rate limit, overloaded,
+ * billing, auth). Its text still reaches the user, but the SDK follows it with no result, so it
+ * must not be read as the start of a turn.
+ */
+function isErroredAssistantMessage(message: SDKMessage): boolean {
+  if (message.type !== "assistant") return false;
+  const error = (message as { error?: unknown }).error;
+  return typeof error === "string" && error.length > 0;
+}
+
 function firstStringField(
   input: Record<string, unknown>,
   primaryKey: string,
@@ -3860,6 +3871,13 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private isAssistantishMessage(message: SDKMessage): boolean {
+    if (isErroredAssistantMessage(message)) {
+      // An errored assistant frame (rate limit, overloaded, billing) is a refusal, not work. The
+      // SDK sends no result behind it, so opening a turn here would leave the agent reporting
+      // "running" until something else closed it, and the next user message would be steered into
+      // a turn whose stream is already gone.
+      return false;
+    }
     return (
       message.type === "assistant" ||
       message.type === "stream_event" ||
@@ -3873,9 +3891,17 @@ class ClaudeAgentSession implements AgentSession {
    * just stopped, trailing assistant output. That is not new work, so it must not open a turn: the
    * only message that would close that turn is the result shouldSuppressStaleResult drops, leaving
    * the agent stuck reporting "running" forever.
+   *
+   * A backgrounded subagent streams on the same channel as its parent, and those frames carry the
+   * parent's tool use id. They are the child working, not the main session starting something, and
+   * no result ever closes a turn opened from them — so reading one as turn-opening left the parent
+   * locked reporting "running" for as long as the child ran, refusing every message sent meanwhile.
    */
   private shouldStartAutonomousTurn(message: SDKMessage): boolean {
     if (this.activeForegroundTurnId || this.pendingInterruptAbort) {
+      return false;
+    }
+    if (readClaudeParentToolUseId(message) !== null) {
       return false;
     }
     return this.isAssistantishMessage(message);

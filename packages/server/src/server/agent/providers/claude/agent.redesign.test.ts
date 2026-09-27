@@ -1182,6 +1182,146 @@ test("reuses one autonomous run for unbound stream_event bursts with no foregrou
   await session.close();
 });
 
+test("does not open an autonomous turn for an errored assistant frame that no result will close", async () => {
+  const session = await createSession();
+  const internal: {
+    turnState: "idle" | "foreground" | "autonomous";
+    routeSdkMessageFromPump: (
+      message: Record<string, unknown>,
+      activeQuery: QueryMock,
+    ) => Promise<void>;
+    autonomousTurn: { id: string } | null;
+  } = asInternals(session);
+  const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+
+  internal.turnState = "idle";
+
+  // A rate limit surfaces as an assistant frame carrying `error`, and the SDK follows it with
+  // nothing: no result ever arrives for it. Treating it as turn-opening work would leave the
+  // agent reporting "running" forever and route the next user message as a steer into a turn
+  // whose stream is already gone.
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "assistant",
+      error: "rate_limit",
+      message: {
+        id: "msg_err",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [{ type: "text", text: "You've hit your session limit" }],
+        stop_reason: null,
+        usage: buildUsage(),
+      },
+      parent_tool_use_id: null,
+      uuid: "uuid-err",
+      session_id: "sess-1",
+    },
+    queryMock,
+  );
+
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("idle");
+
+  await session.close();
+});
+
+test("does not open an autonomous turn for a background subagent's own stream frames", async () => {
+  const session = await createSession();
+  const internal: {
+    turnState: "idle" | "foreground" | "autonomous";
+    routeSdkMessageFromPump: (
+      message: Record<string, unknown>,
+      activeQuery: QueryMock,
+    ) => Promise<void>;
+    autonomousTurn: { id: string } | null;
+  } = asInternals(session);
+  const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+
+  internal.turnState = "idle";
+
+  // A backgrounded subagent keeps streaming on the shared SDK channel after the parent's turn has
+  // already closed. Those frames carry the parent's tool use id, so they are the child's work, not
+  // the main session starting something new. Reading them as turn-opening work left the main agent
+  // reporting "running" until the subagent finished, and routed every message sent in that window
+  // as a steer into a turn that no longer existed.
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "stream_event",
+      parent_tool_use_id: "toolu_subagent_parent",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "child working" },
+      },
+    },
+    queryMock,
+  );
+
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("idle");
+
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "assistant",
+      parent_tool_use_id: "toolu_subagent_parent",
+      message: {
+        id: "msg_child",
+        role: "assistant",
+        model: "claude-opus-5-5",
+        content: [{ type: "text", text: "child reply" }],
+        stop_reason: "end_turn",
+        usage: buildUsage(),
+      },
+      uuid: "uuid-child",
+      session_id: "sess-1",
+    },
+    queryMock,
+  );
+
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("idle");
+
+  await session.close();
+});
+
+test("still opens an autonomous turn for the main session's own unbound frames", async () => {
+  const session = await createSession();
+  const internal: {
+    turnState: "idle" | "foreground" | "autonomous";
+    routeSdkMessageFromPump: (
+      message: Record<string, unknown>,
+      activeQuery: QueryMock,
+    ) => Promise<void>;
+    autonomousTurn: { id: string } | null;
+  } = asInternals(session);
+  const queryMock = createBaseQueryMock(vi.fn(async () => ({ done: true, value: undefined })));
+
+  internal.turnState = "idle";
+
+  // The wake-up case that autonomous turns exist for: a completed background subagent makes the
+  // main session react with no prompt from the user. Unbound frames are the main session's own.
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: "picking this up" },
+      },
+    },
+    queryMock,
+  );
+
+  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+
+  await internal.routeSdkMessageFromPump(
+    { type: "result", subtype: "success", usage: buildUsage(), total_cost_usd: 0 },
+    queryMock,
+  );
+  expect(internal.autonomousTurn).toBeNull();
+
+  await session.close();
+});
+
 test("tracks run lifecycle transitions for success, error, and interrupt", async () => {
   const session = await createSession();
   let streamCase: "success" | "error" | "interrupt" = "success";
