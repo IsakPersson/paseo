@@ -90,6 +90,8 @@ describe("Claude SDK env", () => {
       expect(capturedEnv?.PASEO_TEST_FLAG).toBe(launchContext.env?.PASEO_TEST_FLAG);
       expect(capturedEnv?.MCP_TIMEOUT).toBe("claude-startup-timeout");
       expect(capturedEnv?.MCP_TOOL_TIMEOUT).toBe("claude-tool-timeout");
+      // Paseo reads session_state_changed to know when an autonomous turn is over.
+      expect(capturedEnv?.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe("1");
     } finally {
       await session.close();
     }

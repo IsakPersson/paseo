@@ -1322,6 +1322,170 @@ test("still opens an autonomous turn for the main session's own unbound frames",
   await session.close();
 });
 
+interface SessionStateInternals {
+  turnState: "idle" | "foreground" | "autonomous";
+  routeSdkMessageFromPump: (
+    message: Record<string, unknown>,
+    activeQuery: QueryMock,
+  ) => Promise<void>;
+  autonomousTurn: { id: string } | null;
+  activeForegroundTurnId: string | null;
+}
+
+function sessionState(state: "idle" | "running" | "requires_action") {
+  return {
+    type: "system",
+    subtype: "session_state_changed",
+    state,
+    uuid: `state-${state}`,
+    session_id: "sess-1",
+  };
+}
+
+// A subagent's own background Bash job completing. It carries no parent tool use id, so by frame
+// shape alone it looks like the main session's work. Verified on the wire: the CLI stays idle.
+const subagentOwnedTaskNotification = {
+  type: "system",
+  subtype: "task_notification",
+  task_id: "bg-job-of-subagent",
+  tool_use_id: "toolu_subagent_bash",
+  status: "completed",
+  summary: "Background command completed",
+  output_file: "/tmp/bg-job-of-subagent.output",
+  uuid: "uuid-task-notification",
+  session_id: "sess-1",
+};
+
+function createPendingQueryMock(): QueryMock {
+  return createBaseQueryMock(vi.fn(() => new Promise<never>(() => {})));
+}
+
+test("a subagent's own task notification does not open a turn once Claude reports it is idle", async () => {
+  sdkQueryFactory.mockImplementation(() => createPendingQueryMock());
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const queryMock = createPendingQueryMock();
+
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  await internal.routeSdkMessageFromPump(subagentOwnedTaskNotification, queryMock);
+
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("idle");
+
+  // The next user message starts its own foreground turn rather than landing on a phantom one.
+  const { turnId } = await session.startTurn("PING");
+  expect(internal.activeForegroundTurnId).toBe(turnId);
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("foreground");
+
+  await session.close();
+});
+
+test("session state opens an autonomous turn on running and closes it on idle", async () => {
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const queryMock = createPendingQueryMock();
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  // A finished subagent wakes the main session with no prompt from the user.
+  await internal.routeSdkMessageFromPump(sessionState("running"), queryMock);
+  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+  expect(internal.turnState).toBe("autonomous");
+
+  await internal.routeSdkMessageFromPump(
+    { type: "result", subtype: "success", usage: buildUsage(), total_cost_usd: 0 },
+    queryMock,
+  );
+  expect(internal.autonomousTurn).toBeNull();
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  expect(internal.turnState).toBe("idle");
+
+  expect(events.filter((event) => event.type === "turn_started")).toHaveLength(1);
+  expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+  // State frames are bookkeeping, never timeline content.
+  expect(events.filter((event) => event.type === "timeline")).toHaveLength(0);
+
+  await session.close();
+});
+
+test("an idle session state closes an autonomous turn that no result closed", async () => {
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const queryMock = createPendingQueryMock();
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  // The frame heuristic opens this one: no state frame has been seen yet.
+  await internal.routeSdkMessageFromPump(subagentOwnedTaskNotification, queryMock);
+  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-1");
+
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("idle");
+  expect(events.filter((event) => event.type === "turn_completed")).toHaveLength(1);
+
+  await session.close();
+});
+
+test("frames still open a turn while Claude reports running, and idle closes it", async () => {
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const queryMock = createPendingQueryMock();
+
+  // Claude can drain queued input into a second result without going idle in between. The first
+  // result closed the turn, so the follow-on work needs one of its own.
+  await internal.routeSdkMessageFromPump(sessionState("running"), queryMock);
+  await internal.routeSdkMessageFromPump(
+    { type: "result", subtype: "success", usage: buildUsage(), total_cost_usd: 0 },
+    queryMock,
+  );
+  expect(internal.autonomousTurn).toBeNull();
+
+  await internal.routeSdkMessageFromPump(
+    {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "next" } },
+    },
+    queryMock,
+  );
+  expect(internal.autonomousTurn?.id).toBe("autonomous-turn-2");
+
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("idle");
+
+  await session.close();
+});
+
+test("session state never opens or closes a foreground turn", async () => {
+  sdkQueryFactory.mockImplementation(() => createPendingQueryMock());
+  const session = await createSession();
+  const internal: SessionStateInternals = asInternals(session);
+  const queryMock = createPendingQueryMock();
+
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  const { turnId } = await session.startTurn("hello");
+
+  // The send's own running, then an idle that trails the previous turn and lands late.
+  await internal.routeSdkMessageFromPump(sessionState("running"), queryMock);
+  await internal.routeSdkMessageFromPump(sessionState("idle"), queryMock);
+  expect(internal.activeForegroundTurnId).toBe(turnId);
+  expect(internal.autonomousTurn).toBeNull();
+  expect(internal.turnState).toBe("foreground");
+
+  await internal.routeSdkMessageFromPump(
+    { type: "result", subtype: "success", usage: buildUsage(), total_cost_usd: 0 },
+    queryMock,
+  );
+  expect(internal.activeForegroundTurnId).toBeNull();
+  expect(internal.turnState).toBe("idle");
+
+  await session.close();
+});
+
 test("tracks run lifecycle transitions for success, error, and interrupt", async () => {
   const session = await createSession();
   let streamCase: "success" | "error" | "interrupt" = "success";
