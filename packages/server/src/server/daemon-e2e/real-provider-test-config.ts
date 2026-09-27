@@ -92,6 +92,11 @@ export function getRealProviderRuntimeSettings(provider: RealProvider): Provider
     }
     return {};
   }
+  if (provider === "claude" && !getOpenRouterApiKeyOrNull()) {
+    // No OpenRouter key: same shape as omp/pi above, fall through with no env override so the
+    // installed SDK uses the local Claude login instead of routing through OpenRouter.
+    return {};
+  }
   const apiKey = getOpenRouterApiKey();
   switch (provider) {
     case "claude":
@@ -170,7 +175,11 @@ export function canRunRealProvider(provider: RealProvider): Promise<boolean> {
   }
 
   const availability = (async () => {
-    if (provider !== "omp" && provider !== "pi" && !getOpenRouterApiKeyOrNull()) {
+    // claude falls through to the command-availability check below (no key requirement) exactly
+    // like omp/pi: getRealProviderRuntimeSettings uses the local Claude login when no OpenRouter
+    // key is configured, so tests should be able to run against it.
+    const requiresOpenRouterKey = provider !== "omp" && provider !== "pi" && provider !== "claude";
+    if (requiresOpenRouterKey && !getOpenRouterApiKeyOrNull()) {
       return false;
     }
     return await isCommandAvailable(getProviderBinary(provider));
